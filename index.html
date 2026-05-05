@@ -1,0 +1,638 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>Image → Fourier Series</title>
+<style>
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: -apple-system, system-ui, sans-serif;
+    background: #0e0e12;
+    color: #eaeaea;
+    display: flex;
+    flex-direction: column;
+    min-height: 100vh;
+  }
+  header {
+    padding: 8px 12px;
+    border-bottom: 1px solid #222;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    align-items: center;
+  }
+  header h1 { font-size: 14px; margin: 0 12px 0 0; font-weight: 600; }
+  .controls { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+  main { flex: 1; display: grid; grid-template-columns: 1fr 1fr; gap: 1px; background: #222; }
+  .panel { background: #0e0e12; padding: 8px; display: flex; flex-direction: column; }
+  .panel h2 { font-size: 11px; color: #888; margin: 0 0 4px; font-weight: 500; text-transform: uppercase; letter-spacing: 0.05em; }
+  canvas { background: #111; border-radius: 4px; width: 100%; height: auto; max-height: 78vh; object-fit: contain; cursor: crosshair; }
+  #dst { cursor: grab; }
+  #dst.dragging { cursor: grabbing; }
+  .hint { color: #777; font-size: 11px; margin-top: 4px; }
+  @media (max-width: 800px) { main { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+<header>
+  <h1>Image → Fourier Series</h1>
+  <div class="controls">
+    <input type="file" id="file" accept="image/*" />
+  </div>
+</header>
+<main>
+  <section class="panel">
+    <h2>Source &amp; Outline</h2>
+    <canvas id="src" width="600" height="600"></canvas>
+    <div class="hint" id="srcHint">Upload an image, then click the subject you want to trace.</div>
+  </section>
+  <section class="panel">
+    <h2>Fourier Reconstruction</h2>
+    <canvas id="dst" width="600" height="600"></canvas>
+    <div class="hint" id="status">Waiting for image…</div>
+  </section>
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+const srcCv = $('src'), dstCv = $('dst');
+const sctx = srcCv.getContext('2d'), dctx = dstCv.getContext('2d');
+const fileEl = $('file'),
+      statusEl = $('status'), srcHint = $('srcHint');
+// Single fixed segmentation mode (selector removed for simplicity).
+const MODE = 'click';
+// Stub object so existing references to `modeEl.value` keep working.
+const modeEl = { value: MODE };
+
+// Fixed defaults (previously user-controlled — removed for simpler UI).
+const TOLERANCE = 35;
+const TERMS = 250;
+const INCLUDE_HOLES = true;
+
+let imageBitmap = null;
+let baseImageData = null;
+// Each series = one independent Fourier expansion for one contour.
+// { coeffs:[{freq,amp,phase}], ox, oy, path:[{x,y}...] }
+//   ox/oy = contour centroid offset relative to global image center (image coords).
+let series = [];
+let t = 0;
+let rafId = null;
+let dstScale = 1;        // base fit-to-canvas scale set by segment()
+let zoom = 1;            // user-controlled multiplier (1 = fit)
+let panX = 0, panY = 0;  // canvas-space offset, in dst pixels
+
+fileEl.addEventListener('change', async e => {
+  const f = e.target.files[0]; if (!f) return;
+  imageBitmap = await createImageBitmap(f);
+  zoom = 1; panX = 0; panY = 0;
+  drawSource();
+  // Auto-seed at top-left corner — almost certainly background. The pipeline's
+  // touchesBorder check then auto-inverts to extract the real subjects.
+  lastSeed = { x: 2, y: 2 };
+  segment();
+});
+
+// Wheel: zoom anchored at the cursor.
+dstCv.addEventListener('wheel', e => {
+  e.preventDefault();
+  const rect = dstCv.getBoundingClientRect();
+  const sx = dstCv.width / rect.width;
+  const cx = (e.clientX - rect.left) * sx - dstCv.width / 2;
+  const cy = (e.clientY - rect.top) * sx - dstCv.height / 2;
+  const factor = e.deltaY < 0 ? 1.1 : 1 / 1.1;
+  const newZoom = Math.min(Math.max(zoom * factor, 0.2), 8);
+  panX = cx - (cx - panX) * (newZoom / zoom);
+  panY = cy - (cy - panY) * (newZoom / zoom);
+  zoom = newZoom;
+}, { passive: false });
+
+// Click + drag: pan. Double-click: reset view.
+let dragging = false, dragStart = null;
+dstCv.addEventListener('mousedown', e => {
+  dragging = true;
+  dstCv.classList.add('dragging');
+  dragStart = { x: e.clientX, y: e.clientY, panX, panY };
+});
+window.addEventListener('mousemove', e => {
+  if (!dragging) return;
+  const rect = dstCv.getBoundingClientRect();
+  const sx = dstCv.width / rect.width;
+  panX = dragStart.panX + (e.clientX - dragStart.x) * sx;
+  panY = dragStart.panY + (e.clientY - dragStart.y) * sx;
+});
+window.addEventListener('mouseup', () => {
+  dragging = false;
+  dstCv.classList.remove('dragging');
+});
+dstCv.addEventListener('dblclick', () => { zoom = 1; panX = 0; panY = 0; });
+
+// Render the unicode treble clef as the default subject so the page is
+// non-empty on first load. Falls back silently if the glyph isn't supported.
+function loadDefaultGlyph() {
+  const W = srcCv.width, H = srcCv.height;
+  sctx.fillStyle = '#fff'; sctx.fillRect(0, 0, W, H);
+  sctx.fillStyle = '#000';
+  sctx.textAlign = 'center';
+  sctx.textBaseline = 'middle';
+  sctx.font = '460px "Apple Symbols", "Segoe UI Symbol", "Noto Music", "DejaVu Sans", serif';
+  sctx.fillText('\u{1D11E}', W / 2, H / 2);
+  baseImageData = sctx.getImageData(0, 0, W, H);
+  // Sanity check: any dark pixels actually rendered?
+  let darkCount = 0;
+  const d = baseImageData.data;
+  for (let i = 0; i < d.length; i += 4) {
+    if (d[i] < 50) darkCount++;
+    if (darkCount > 500) break;
+  }
+  if (darkCount < 500) return; // glyph not supported by any installed font
+  lastSeed = { x: 2, y: 2 };
+  segment();
+}
+
+srcCv.addEventListener('click', e => {
+  if (!baseImageData) return;
+  const rect = srcCv.getBoundingClientRect();
+  const x = Math.round((e.clientX - rect.left) * (srcCv.width / rect.width));
+  const y = Math.round((e.clientY - rect.top) * (srcCv.height / rect.height));
+  segment({ x, y });
+});
+
+function drawSource() {
+  const W = srcCv.width, H = srcCv.height;
+  sctx.fillStyle = '#fff'; sctx.fillRect(0, 0, W, H);
+  const r = Math.min(W / imageBitmap.width, H / imageBitmap.height);
+  const dw = imageBitmap.width * r, dh = imageBitmap.height * r;
+  sctx.drawImage(imageBitmap, (W - dw) / 2, (H - dh) / 2, dw, dh);
+  baseImageData = sctx.getImageData(0, 0, W, H);
+}
+
+let lastSeed = null;
+
+function segment(seed = null) {
+  if (!baseImageData) return;
+  const W = srcCv.width, H = srcCv.height;
+  // restore source pixels
+  sctx.putImageData(baseImageData, 0, 0);
+
+  const mode = modeEl.value;
+  const tol = TOLERANCE;
+  let mask;
+
+  if (mode === 'click') {
+    if (seed) lastSeed = seed;
+    if (!lastSeed) {
+      srcHint.textContent = 'Click on the subject in the image to extract its outline.';
+      return;
+    }
+    mask = floodMask(baseImageData, W, H, lastSeed.x, lastSeed.y, tol);
+    // If the flooded region touches the image border, the user clicked the
+    // background. Switch from connectivity-based flood to *global* color
+    // exclusion: any pixel close to the seed color is bg, regardless of
+    // whether it's reachable. This preserves "white islands" inside letters
+    // (e.g. the inner ring of O) as holes instead of merging them into fg.
+    if (touchesBorder(mask, W, H)) {
+      mask = colorExcludeMask(baseImageData, lastSeed.x, lastSeed.y, tol);
+    }
+  } else if (mode === 'edges') {
+    mask = sobelMask(baseImageData, W, H, tol);
+  } else {
+    const inv = mode === 'threshold-inv';
+    mask = lumThresholdMask(baseImageData, tol * 2.55, inv);
+  }
+
+  const comps = allComponents(mask, W, H, 40);
+  if (!comps.length) {
+    statusEl.textContent = 'No subject found — try another mode or adjust Tolerance.';
+    series = []; cancelAnimationFrame(rafId); return;
+  }
+  // Keep all components above absolute floor; only drop ones <0.05% of biggest (true noise).
+  const minRel = comps[0].size * 0.0005;
+  const kept = comps.filter(c => c.size >= minRel);
+
+  const wantHoles = INCLUDE_HOLES && (mode === 'click' || mode === 'threshold' || mode === 'threshold-inv');
+  const contours = [];
+  for (const comp of kept) {
+    const outer = traceBoundary(comp.mask, W, H, comp.start);
+    if (outer.length < 16) continue;
+    contours.push(outer);
+    if (wantHoles) {
+      const holes = findHoles(comp.mask, W, H);
+      for (const h of holes) {
+        const tr = traceBoundary(h.mask, W, H, h.start);
+        if (tr.length >= 8) contours.push(tr);
+      }
+    }
+  }
+  if (!contours.length) { statusEl.textContent = 'Outline too small.'; return; }
+
+  // Resample each contour to a fixed N (per-contour, independent DFTs).
+  const N = 512;
+  const sampled = contours.map(c => resample(c, N));
+
+  // Global bounding box across all contours → image center & dst scale.
+  let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+  for (const c of sampled) for (const p of c) {
+    if (p.x < minX) minX = p.x; if (p.x > maxX) maxX = p.x;
+    if (p.y < minY) minY = p.y; if (p.y > maxY) maxY = p.y;
+  }
+  const cx = (minX + maxX) / 2, cy = (minY + maxY) / 2;
+  const target = dstCv.width * 0.8;
+  dstScale = target / Math.max(maxX - minX, maxY - minY);
+
+  // Build one independent Fourier series per contour. Each contour is centered
+  // around its own centroid for the DFT (so DC = 0); offset is stored separately
+  // to place the epicycle stack at the right location in the dst canvas.
+  series = sampled.map(pts => {
+    let sx = 0, sy = 0;
+    for (const p of pts) { sx += p.x; sy += p.y; }
+    sx /= pts.length; sy /= pts.length;
+    const rel = pts.map(p => ({ x: p.x - sx, y: p.y - sy }));
+    const cf = dft(rel);
+    cf.sort((a, b) => b.amp - a.amp);
+    return { coeffs: cf, ox: sx - cx, oy: sy - cy, lastX: undefined, lastY: undefined };
+  });
+
+  // overlay each contour on source canvas.
+  sctx.strokeStyle = '#2a6df4'; sctx.lineWidth = 2;
+  for (const c of sampled) {
+    sctx.beginPath();
+    sctx.moveTo(c[0].x, c[0].y);
+    for (const p of c) sctx.lineTo(p.x, p.y);
+    sctx.closePath(); sctx.stroke();
+  }
+
+  if (mode === 'click' && lastSeed) {
+    sctx.fillStyle = '#ff3366';
+    sctx.beginPath(); sctx.arc(lastSeed.x, lastSeed.y, 5, 0, Math.PI * 2); sctx.fill();
+  }
+
+  srcHint.textContent = `${series.length} independent series × ${N} samples. Scale ×${dstScale.toFixed(2)}.`;
+  restart();
+}
+
+function perimeter(pts) {
+  let s = 0;
+  for (let i = 0; i < pts.length; i++) {
+    const a = pts[i], b = pts[(i + 1) % pts.length];
+    s += Math.hypot(b.x - a.x, b.y - a.y);
+  }
+  return s;
+}
+
+// Find connected zero-pixel regions (holes) inside `mask` that don't touch
+// the image border. Returns array of {mask, start} for boundary tracing.
+function findHoles(fgMask, W, H) {
+  // Build outside-of-foreground mask, then BFS from all border pixels to flag the
+  // exterior. Anything zero AND not exterior = a hole.
+  const exterior = new Uint8Array(W * H);
+  const queue = [];
+  for (let x = 0; x < W; x++) {
+    if (!fgMask[x]) { exterior[x] = 1; queue.push(x); }
+    const k = (H - 1) * W + x;
+    if (!fgMask[k]) { exterior[k] = 1; queue.push(k); }
+  }
+  for (let y = 0; y < H; y++) {
+    const a = y * W, b = y * W + (W - 1);
+    if (!fgMask[a]) { exterior[a] = 1; queue.push(a); }
+    if (!fgMask[b]) { exterior[b] = 1; queue.push(b); }
+  }
+  while (queue.length) {
+    const k = queue.pop();
+    const x = k % W, y = (k / W) | 0;
+    for (const [dx, dy] of [[1,0],[-1,0],[0,1],[0,-1]]) {
+      const nx = x + dx, ny = y + dy;
+      if (nx < 0 || ny < 0 || nx >= W || ny >= H) continue;
+      const ni = ny * W + nx;
+      if (!fgMask[ni] && !exterior[ni]) { exterior[ni] = 1; queue.push(ni); }
+    }
+  }
+  // Now collect connected components of (zero AND not exterior). For each, build
+  // a mask of the *boundary fg pixels* surrounding it so traceBoundary works.
+  const visited = new Uint8Array(W * H);
+  const holes = [];
+  for (let y = 1; y < H - 1; y++) {
+    for (let x = 1; x < W - 1; x++) {
+      const i = y * W + x;
+      if (fgMask[i] || exterior[i] || visited[i]) continue;
+      // BFS the hole interior
+      const interior = [];
+      const q = [i]; visited[i] = 1;
+      while (q.length) {
+        const k = q.pop();
+        interior.push(k);
+        const kx = k % W, ky = (k / W) | 0;
+        for (const [dx, dy] of [[1,0],[-1,0],[0,1],[0,-1]]) {
+          const nx = kx + dx, ny = ky + dy;
+          if (nx < 0 || ny < 0 || nx >= W || ny >= H) continue;
+          const ni = ny * W + nx;
+          if (!fgMask[ni] && !exterior[ni] && !visited[ni]) { visited[ni] = 1; q.push(ni); }
+        }
+      }
+      if (interior.length < 6) continue; // skip pinhole noise but keep small details (eyes etc.)
+      // Build a foreground-only mask: pixels that are fg AND adjacent to this hole's
+      // interior. Then trace its boundary. Easier: just trace the hole itself by
+      // dilating it once → we get a ring of fg pixels around it, then boundary trace.
+      const ringMask = new Uint8Array(W * H);
+      let sx = W, sy = H;
+      for (const k of interior) {
+        const kx = k % W, ky = (k / W) | 0;
+        for (const [dx, dy] of [[1,0],[-1,0],[0,1],[0,-1],[1,1],[1,-1],[-1,1],[-1,-1]]) {
+          const nx = kx + dx, ny = ky + dy;
+          if (nx < 0 || ny < 0 || nx >= W || ny >= H) continue;
+          const ni = ny * W + nx;
+          if (fgMask[ni]) {
+            ringMask[ni] = 1;
+            if (ny < sy || (ny === sy && nx < sx)) { sx = nx; sy = ny; }
+          }
+        }
+      }
+      if (sx < W) holes.push({ mask: ringMask, start: { x: sx, y: sy } });
+    }
+  }
+  return holes;
+}
+
+// Global color-distance mask: pixel = 1 (foreground) if its color differs
+// from the seed pixel's color by more than `tol` (in RGB). Used when the
+// user has clicked the background — every pixel close to that color is bg.
+function colorExcludeMask(img, sx, sy, tol) {
+  const W = img.width, H = img.height;
+  const data = img.data;
+  const i0 = (sy * W + sx) * 4;
+  const r0 = data[i0], g0 = data[i0 + 1], b0 = data[i0 + 2];
+  const tol2 = tol * tol * 3;
+  const mask = new Uint8Array(W * H);
+  for (let i = 0, p = 0; i < data.length; i += 4, p++) {
+    const dr = data[i] - r0, dg = data[i + 1] - g0, db = data[i + 2] - b0;
+    mask[p] = (dr * dr + dg * dg + db * db) > tol2 ? 1 : 0;
+  }
+  return mask;
+}
+
+function touchesBorder(mask, W, H) {
+  for (let x = 0; x < W; x++) if (mask[x] || mask[(H - 1) * W + x]) return true;
+  for (let y = 0; y < H; y++) if (mask[y * W] || mask[y * W + W - 1]) return true;
+  return false;
+}
+
+// Flood-fill mask: connected pixels with color distance ≤ tol from seed.
+function floodMask(img, W, H, sx, sy, tol) {
+  const mask = new Uint8Array(W * H);
+  const data = img.data;
+  const idx = (x, y) => (y * W + x) * 4;
+  const i0 = idx(sx, sy);
+  const r0 = data[i0], g0 = data[i0 + 1], b0 = data[i0 + 2];
+  const tol2 = tol * tol * 3; // squared, 3 channels
+  const stack = [[sx, sy]];
+  while (stack.length) {
+    const [x, y] = stack.pop();
+    if (x < 0 || y < 0 || x >= W || y >= H) continue;
+    const m = y * W + x;
+    if (mask[m]) continue;
+    const i = m * 4;
+    const dr = data[i] - r0, dg = data[i + 1] - g0, db = data[i + 2] - b0;
+    if (dr * dr + dg * dg + db * db > tol2) continue;
+    mask[m] = 1;
+    stack.push([x + 1, y]); stack.push([x - 1, y]);
+    stack.push([x, y + 1]); stack.push([x, y - 1]);
+  }
+  return mask;
+}
+
+function lumThresholdMask(img, T, invert) {
+  const mask = new Uint8Array(img.width * img.height);
+  const d = img.data;
+  for (let i = 0, p = 0; i < d.length; i += 4, p++) {
+    const lum = 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2];
+    const on = invert ? lum > T : lum < T;
+    mask[p] = on ? 1 : 0;
+  }
+  return mask;
+}
+
+function sobelMask(img, W, H, tolPct) {
+  const d = img.data;
+  const gray = new Float32Array(W * H);
+  for (let i = 0, p = 0; i < d.length; i += 4, p++) {
+    gray[p] = 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2];
+  }
+  const mag = new Float32Array(W * H);
+  let maxMag = 0;
+  for (let y = 1; y < H - 1; y++) {
+    for (let x = 1; x < W - 1; x++) {
+      const i = y * W + x;
+      const gx =
+        -gray[i - W - 1] - 2 * gray[i - 1] - gray[i + W - 1] +
+         gray[i - W + 1] + 2 * gray[i + 1] + gray[i + W + 1];
+      const gy =
+        -gray[i - W - 1] - 2 * gray[i - W] - gray[i - W + 1] +
+         gray[i + W - 1] + 2 * gray[i + W] + gray[i + W + 1];
+      const m = Math.hypot(gx, gy);
+      mag[i] = m;
+      if (m > maxMag) maxMag = m;
+    }
+  }
+  const T = (tolPct / 100) * maxMag;
+  const mask = new Uint8Array(W * H);
+  for (let i = 0; i < mag.length; i++) mask[i] = mag[i] > T ? 1 : 0;
+  return mask;
+}
+
+function allComponents(mask, W, H, minSize) {
+  const visited = new Uint8Array(W * H);
+  const out = [];
+  for (let y = 0; y < H; y++) {
+    for (let x = 0; x < W; x++) {
+      const i = y * W + x;
+      if (!mask[i] || visited[i]) continue;
+      const queue = [i]; visited[i] = 1;
+      let size = 0; const cellMask = new Uint8Array(W * H);
+      let startX = x, startY = y;
+      while (queue.length) {
+        const k = queue.pop();
+        cellMask[k] = 1; size++;
+        const kx = k % W, ky = (k / W) | 0;
+        if (ky < startY || (ky === startY && kx < startX)) { startX = kx; startY = ky; }
+        for (const [dx, dy] of [[1,0],[-1,0],[0,1],[0,-1]]) {
+          const nx = kx + dx, ny = ky + dy;
+          if (nx < 0 || ny < 0 || nx >= W || ny >= H) continue;
+          const ni = ny * W + nx;
+          if (mask[ni] && !visited[ni]) { visited[ni] = 1; queue.push(ni); }
+        }
+      }
+      if (size >= minSize) out.push({ size, mask: cellMask, start: { x: startX, y: startY } });
+    }
+  }
+  out.sort((a, b) => b.size - a.size);
+  return out;
+}
+
+function traceBoundary(mask, W, H, start) {
+  const dirs = [[1,0],[1,1],[0,1],[-1,1],[-1,0],[-1,-1],[0,-1],[1,-1]];
+  const get = (x, y) => (x < 0 || y < 0 || x >= W || y >= H) ? 0 : mask[y * W + x];
+  const out = [];
+  let x = start.x, y = start.y, dir = 0;
+  out.push({ x, y });
+  const max = W * H * 4;
+  for (let step = 0; step < max; step++) {
+    let found = false;
+    for (let i = 0; i < 8; i++) {
+      const d = (dir + 6 + i) % 8;
+      const nx = x + dirs[d][0], ny = y + dirs[d][1];
+      if (get(nx, ny)) {
+        x = nx; y = ny; dir = d; out.push({ x, y }); found = true; break;
+      }
+    }
+    if (!found) break;
+    if (out.length > 2 && x === start.x && y === start.y) break;
+  }
+  return out;
+}
+
+function resample(points, N) {
+  let total = 0; const segs = [];
+  for (let i = 0; i < points.length; i++) {
+    const a = points[i], b = points[(i + 1) % points.length];
+    const d = Math.hypot(b.x - a.x, b.y - a.y);
+    segs.push(d); total += d;
+  }
+  const step = total / N;
+  const out = [];
+  let segIdx = 0, segAcc = 0;
+  for (let i = 0; i < N; i++) {
+    const target = i * step;
+    while (segIdx < segs.length && segAcc + segs[segIdx] < target) {
+      segAcc += segs[segIdx]; segIdx++;
+    }
+    if (segIdx >= segs.length) break;
+    const a = points[segIdx], b = points[(segIdx + 1) % points.length];
+    const f = segs[segIdx] === 0 ? 0 : (target - segAcc) / segs[segIdx];
+    out.push({ x: a.x + (b.x - a.x) * f, y: a.y + (b.y - a.y) * f });
+  }
+  return out;
+}
+
+function dft(points) {
+  const N = points.length;
+  const out = [];
+  for (let k = 0; k < N; k++) {
+    let re = 0, im = 0;
+    for (let n = 0; n < N; n++) {
+      const phi = (2 * Math.PI * k * n) / N;
+      const cos = Math.cos(phi), sin = Math.sin(phi);
+      re += points[n].x * cos + points[n].y * sin;
+      im += -points[n].x * sin + points[n].y * cos;
+    }
+    re /= N; im /= N;
+    const freq = k <= N / 2 ? k : k - N;
+    out.push({ freq, amp: Math.hypot(re, im), phase: Math.atan2(im, re) });
+  }
+  return out;
+}
+
+// Offscreen canvas holding the persistent trail. Each frame we apply a faint
+// translucent overlay to fade old strokes, then append only the newest segment
+// per series. The dst canvas composites this trail under the live epicycles.
+let trailCv = null, trailCtx = null;
+const BG = '#111';
+const FADE_ALPHA = 0.00598; // half-life ~116 frames (~1.93s at 60fps)
+
+function ensureTrail() {
+  if (trailCv && trailCv.width === dstCv.width) return;
+  trailCv = document.createElement('canvas');
+  trailCv.width = dstCv.width; trailCv.height = dstCv.height;
+  trailCtx = trailCv.getContext('2d');
+  trailCtx.fillStyle = BG;
+  trailCtx.fillRect(0, 0, trailCv.width, trailCv.height);
+  trailCtx.lineCap = 'round';
+  trailCtx.lineJoin = 'round';
+}
+
+function clearTrail() {
+  ensureTrail();
+  trailCtx.fillStyle = BG;
+  trailCtx.fillRect(0, 0, trailCv.width, trailCv.height);
+}
+
+function restart() {
+  for (const s of series) { s.lastX = undefined; s.lastY = undefined; }
+  t = 0;
+  clearTrail();
+  cancelAnimationFrame(rafId);
+  rafId = requestAnimationFrame(draw);
+  const perSeries = series[0] ? Math.min(TERMS, series[0].coeffs.length) : 0;
+  statusEl.textContent = `${series.length} series × ${perSeries} terms each`;
+}
+
+const TRAIL_COLORS = ['#ffd23f', '#ff6b9d', '#4dd0e1', '#a5d6a7', '#ce93d8', '#ffb74d'];
+
+function draw() {
+  ensureTrail();
+  const W = dstCv.width, H = dstCv.height;
+
+  // 1) Fade the persistent trail buffer.
+  trailCtx.fillStyle = `rgba(17,17,17,${FADE_ALPHA})`;
+  trailCtx.fillRect(0, 0, W, H);
+
+  const nTerms = TERMS;
+  const epicycles = []; // per-series arc data, drawn on top of dst each frame
+
+  // 2) Advance each series in *world coords* (zoom=1, pan=0). The trail buffer
+  // stores untransformed strokes; zoom/pan are applied only when compositing,
+  // so changing them doesn't invalidate the buffer.
+  for (let k = 0; k < series.length; k++) {
+    const s = series[k];
+    let x = W / 2 + s.ox * dstScale;
+    let y = H / 2 + s.oy * dstScale;
+    const arcs = [];
+    const N = Math.min(nTerms, s.coeffs.length);
+    for (let i = 0; i < N; i++) {
+      const { freq, amp, phase } = s.coeffs[i];
+      const a = amp * dstScale;
+      const px = x, py = y;
+      x += a * Math.cos(freq * t + phase);
+      y += a * Math.sin(freq * t + phase);
+      if (a > 0.5) arcs.push({ px, py, x, y, a });
+    }
+    if (s.lastX !== undefined) {
+      trailCtx.strokeStyle = TRAIL_COLORS[k % TRAIL_COLORS.length];
+      trailCtx.lineWidth = 2;
+      trailCtx.beginPath();
+      trailCtx.moveTo(s.lastX, s.lastY);
+      trailCtx.lineTo(x, y);
+      trailCtx.stroke();
+    }
+    s.lastX = x; s.lastY = y;
+    epicycles.push(arcs);
+  }
+
+  // 3) Composite onto dst with current zoom/pan transform.
+  dctx.fillStyle = BG; dctx.fillRect(0, 0, W, H);
+  dctx.save();
+  dctx.translate(W / 2 + panX, H / 2 + panY);
+  dctx.scale(zoom, zoom);
+  dctx.translate(-W / 2, -H / 2);
+  dctx.drawImage(trailCv, 0, 0);
+  dctx.strokeStyle = 'rgba(255,255,255,0.25)';
+  dctx.lineWidth = 1 / zoom;
+  for (const arcs of epicycles) {
+    for (const { px, py, x, y, a } of arcs) {
+      dctx.beginPath(); dctx.arc(px, py, a, 0, Math.PI * 2); dctx.stroke();
+      dctx.beginPath(); dctx.moveTo(px, py); dctx.lineTo(x, y); dctx.stroke();
+    }
+  }
+  dctx.restore();
+
+  const dt = 2 * Math.PI / 512;
+  t += dt;
+  if (t > Math.PI * 2) t -= Math.PI * 2;
+  // No path reset — fade buffer continually refreshes; new revolution overdraws old.
+
+  rafId = requestAnimationFrame(draw);
+}
+
+loadDefaultGlyph();
+</script>
+</body>
+</html>
