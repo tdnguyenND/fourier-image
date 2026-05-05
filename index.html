@@ -537,6 +537,7 @@ function dft(points) {
 let trailCv = null, trailCtx = null;
 const BG = '#111';
 const FADE_ALPHA = 0.00598; // half-life ~116 frames (~1.93s at 60fps)
+const SUB_STEPS = 6;        // sub-samples per frame for smoother trail strokes
 
 function ensureTrail() {
   if (trailCv && trailCv.width === dstCv.width) return;
@@ -578,33 +579,41 @@ function draw() {
   const nTerms = TERMS;
   const epicycles = []; // per-series arc data, drawn on top of dst each frame
 
-  // 2) Advance each series in *world coords* (zoom=1, pan=0). The trail buffer
-  // stores untransformed strokes; zoom/pan are applied only when compositing,
-  // so changing them doesn't invalidate the buffer.
-  for (let k = 0; k < series.length; k++) {
-    const s = series[k];
-    let x = W / 2 + s.ox * dstScale;
-    let y = H / 2 + s.oy * dstScale;
-    const arcs = [];
-    const N = Math.min(nTerms, s.coeffs.length);
-    for (let i = 0; i < N; i++) {
-      const { freq, amp, phase } = s.coeffs[i];
-      const a = amp * dstScale;
-      const px = x, py = y;
-      x += a * Math.cos(freq * t + phase);
-      y += a * Math.sin(freq * t + phase);
-      if (a > 0.5) arcs.push({ px, py, x, y, a });
+  // 2) Advance each series with sub-stepping for smoother trail strokes.
+  // Trail is drawn in world coords (zoom=1, pan=0); display transform applies
+  // only at composite time, so zoom/pan don't invalidate the buffer.
+  const baseDt = 2 * Math.PI / 512;
+  const subDt = baseDt / SUB_STEPS;
+  for (let k = 0; k < series.length; k++) epicycles.push(null);
+
+  for (let step = 0; step < SUB_STEPS; step++) {
+    const tStep = t + step * subDt;
+    const isLast = step === SUB_STEPS - 1;
+    for (let k = 0; k < series.length; k++) {
+      const s = series[k];
+      let x = W / 2 + s.ox * dstScale;
+      let y = H / 2 + s.oy * dstScale;
+      const arcs = isLast ? [] : null;
+      const N = Math.min(nTerms, s.coeffs.length);
+      for (let i = 0; i < N; i++) {
+        const { freq, amp, phase } = s.coeffs[i];
+        const a = amp * dstScale;
+        const px = x, py = y;
+        x += a * Math.cos(freq * tStep + phase);
+        y += a * Math.sin(freq * tStep + phase);
+        if (isLast && a > 0.5) arcs.push({ px, py, x, y, a });
+      }
+      if (s.lastX !== undefined) {
+        trailCtx.strokeStyle = TRAIL_COLORS[k % TRAIL_COLORS.length];
+        trailCtx.lineWidth = 2;
+        trailCtx.beginPath();
+        trailCtx.moveTo(s.lastX, s.lastY);
+        trailCtx.lineTo(x, y);
+        trailCtx.stroke();
+      }
+      s.lastX = x; s.lastY = y;
+      if (isLast) epicycles[k] = arcs;
     }
-    if (s.lastX !== undefined) {
-      trailCtx.strokeStyle = TRAIL_COLORS[k % TRAIL_COLORS.length];
-      trailCtx.lineWidth = 2;
-      trailCtx.beginPath();
-      trailCtx.moveTo(s.lastX, s.lastY);
-      trailCtx.lineTo(x, y);
-      trailCtx.stroke();
-    }
-    s.lastX = x; s.lastY = y;
-    epicycles.push(arcs);
   }
 
   // 3) Composite onto dst with current zoom/pan transform.
@@ -624,8 +633,7 @@ function draw() {
   }
   dctx.restore();
 
-  const dt = 2 * Math.PI / 512;
-  t += dt;
+  t += baseDt;
   if (t > Math.PI * 2) t -= Math.PI * 2;
   // No path reset — fade buffer continually refreshes; new revolution overdraws old.
 
