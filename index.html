@@ -228,7 +228,11 @@ function segment(seed = null) {
 
   // Resample each contour to a fixed N (per-contour, independent DFTs).
   const N = 512;
-  const sampled = contours.map(c => resample(c, N));
+  // Smooth resampled points with a small moving-average window to remove
+  // the 1px staircase jitter introduced by boundary tracing on a binary mask.
+  // Two passes of mild smoothing acts like a softer Gaussian than one wider pass —
+  // removes pixel-staircase noise while preserving sharp corners better.
+  const sampled = contours.map(c => smoothCyclic(smoothCyclic(resample(c, N), 2), 2));
 
   // Global bounding box across all contours → image center & dst scale.
   let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
@@ -513,6 +517,23 @@ function resample(points, N) {
   return out;
 }
 
+// Cyclic moving average over `points` with window radius `r` (window size = 2r+1).
+function smoothCyclic(points, r) {
+  const N = points.length;
+  if (N === 0 || r <= 0) return points;
+  const out = new Array(N);
+  const w = 2 * r + 1;
+  for (let i = 0; i < N; i++) {
+    let sx = 0, sy = 0;
+    for (let j = -r; j <= r; j++) {
+      const k = ((i + j) % N + N) % N;
+      sx += points[k].x; sy += points[k].y;
+    }
+    out[i] = { x: sx / w, y: sy / w };
+  }
+  return out;
+}
+
 function dft(points) {
   const N = points.length;
   const out = [];
@@ -537,15 +558,18 @@ function dft(points) {
 let trailCv = null, trailCtx = null;
 const BG = '#111';
 const FADE_ALPHA = 0.00598; // half-life ~116 frames (~1.93s at 60fps)
-const SUB_STEPS = 6;        // sub-samples per frame for smoother trail strokes
+const SUB_STEPS = 10;       // sub-samples per frame for smoother trail strokes
+const TRAIL_SCALE = 4;      // trail buffer resolution multiplier (anti-pixelation at zoom)
 
 function ensureTrail() {
-  if (trailCv && trailCv.width === dstCv.width) return;
+  if (trailCv && trailCv.width === dstCv.width * TRAIL_SCALE) return;
   trailCv = document.createElement('canvas');
-  trailCv.width = dstCv.width; trailCv.height = dstCv.height;
+  trailCv.width = dstCv.width * TRAIL_SCALE;
+  trailCv.height = dstCv.height * TRAIL_SCALE;
   trailCtx = trailCv.getContext('2d');
+  trailCtx.scale(TRAIL_SCALE, TRAIL_SCALE); // strokes use canvas-space coords
   trailCtx.fillStyle = BG;
-  trailCtx.fillRect(0, 0, trailCv.width, trailCv.height);
+  trailCtx.fillRect(0, 0, dstCv.width, dstCv.height);
   trailCtx.lineCap = 'round';
   trailCtx.lineJoin = 'round';
 }
@@ -553,7 +577,7 @@ function ensureTrail() {
 function clearTrail() {
   ensureTrail();
   trailCtx.fillStyle = BG;
-  trailCtx.fillRect(0, 0, trailCv.width, trailCv.height);
+  trailCtx.fillRect(0, 0, dstCv.width, dstCv.height);
 }
 
 function restart() {
@@ -622,7 +646,9 @@ function draw() {
   dctx.translate(W / 2 + panX, H / 2 + panY);
   dctx.scale(zoom, zoom);
   dctx.translate(-W / 2, -H / 2);
-  dctx.drawImage(trailCv, 0, 0);
+  dctx.imageSmoothingEnabled = true;
+  dctx.imageSmoothingQuality = 'high';
+  dctx.drawImage(trailCv, 0, 0, W, H);
   dctx.strokeStyle = 'rgba(255,255,255,0.25)';
   dctx.lineWidth = 1 / zoom;
   for (const arcs of epicycles) {
